@@ -254,7 +254,7 @@
     text-align:right;
     white-space:nowrap;
   }
-  .rowbtns{display:flex;gap:6px;}
+  .rowbtns{display:flex;gap:6px;flex-wrap:wrap;}
 
   .stamp{
     display:inline-block;
@@ -444,8 +444,8 @@
 
 <script>
 // ====== CONFIG — fill these in after creating your Supabase project ======
-const SUPABASE_URL = 'https://cldrppygnocudcwwzwll.supabase.co';
-const SUPABASE_ANON_KEY = 'sb_publishable_ZvpNH9xY7BhXr5A3__X79w_-oTelZ2M';
+const SUPABASE_URL = 'YOUR_SUPABASE_URL_HERE';
+const SUPABASE_ANON_KEY = 'YOUR_SUPABASE_ANON_KEY_HERE';
 const ATTACHMENTS_BUCKET = 'attachments';
 // ============================================================================
 
@@ -693,6 +693,7 @@ function renderMain(project){
               <td class="amount">${fmt(e.amount)}${n>0? ` <span class="clip-count" title="${n} attachment${n!==1?'s':''}">📎${n}</span>`:''}</td>
               <td>
                 <div class="rowbtns">
+                  <button class="btn subtle small" data-files="${e.id}">Files${n>0?' ('+n+')':''}</button>
                   <button class="btn subtle small" data-edit="${e.id}">Edit</button>
                   <button class="btn danger small" data-del="${e.id}">Del</button>
                 </div>
@@ -721,9 +722,111 @@ function attachEntryHandlers(project){
       openEntryModal(project.id, entry);
     };
   });
+  document.querySelectorAll('[data-files]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const entry = state.entries.find(e=>e.id===btn.dataset.files);
+      openAttachmentsModal(project.id, entry);
+    };
+  });
   document.querySelectorAll('[data-del]').forEach(btn=>{
     btn.onclick = ()=> deleteEntry(btn.dataset.del, project);
   });
+}
+
+function attachmentsSectionHtml(entryId){
+  const attachments = attachmentsForEntry(entryId);
+  return `
+    <div class="attach-block">
+      <div class="attach-label">Receipts &amp; invoices</div>
+      <div class="attach-list" id="attach-list">
+        ${attachments.length===0 ? `<div class="attach-empty">No files attached yet.</div>` : attachments.map(a=>`
+          <div class="attach-item">
+            <a href="${sb.storage.from(ATTACHMENTS_BUCKET).getPublicUrl(a.storagePath).data.publicUrl}" target="_blank" rel="noopener">${escapeHtml(a.fileName)}</a>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="fsize">${fmtBytes(a.sizeBytes)}</span>
+              <button type="button" class="btn danger small" data-del-attach="${a.id}" data-path="${escapeAttr(a.storagePath)}">Remove</button>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <input type="file" id="attach-input" multiple>
+      <div class="attach-note">Files upload immediately and are saved right away.</div>
+    </div>
+  `;
+}
+
+function wireAttachmentsSection(entryId, onAfterChange){
+  const fileInput = document.getElementById('attach-input');
+  if(fileInput){
+    fileInput.onchange = async (ev)=>{
+      const files = Array.from(ev.target.files || []);
+      if(!files.length) return;
+      for(const file of files){
+        try{
+          const path = `${entryId}/${Date.now()}_${file.name}`;
+          const { error: upErr } = await sb.storage.from(ATTACHMENTS_BUCKET).upload(path, file);
+          if(upErr) throw upErr;
+          const { error: insErr } = await sb.from('attachments').insert({
+            entry_id: entryId, file_name: file.name, storage_path: path,
+            size_bytes: file.size, content_type: file.type
+          });
+          if(insErr) throw insErr;
+          showToast(`Uploaded ${file.name}`);
+        }catch(err){
+          console.error(err);
+          showToast(`Upload failed for ${file.name}: ` + (err.message||'unknown error'));
+        }
+      }
+      await loadData();
+      onAfterChange();
+    };
+  }
+  document.querySelectorAll('[data-del-attach]').forEach(btn=>{
+    btn.onclick = async ()=>{
+      if(!confirm('Remove this attachment?')) return;
+      try{
+        await sb.storage.from(ATTACHMENTS_BUCKET).remove([btn.dataset.path]);
+        const { error } = await sb.from('attachments').delete().eq('id', btn.dataset.delAttach);
+        if(error) throw error;
+        await loadData();
+        showToast('Attachment removed');
+        onAfterChange();
+      }catch(err){
+        console.error(err);
+        showToast('Remove failed: ' + (err.message||'unknown error'));
+      }
+    };
+  });
+}
+
+function openAttachmentsModal(projectId, entry){
+  const existing = document.getElementById('files-modal-overlay');
+  if(existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'files-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Files — ${escapeHtml(entry.vendor || 'entry')}</h3>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin:-8px 0 14px;">${escapeHtml(entry.description||'')} ${entry.date? '· '+entry.date : ''}</div>
+      ${attachmentsSectionHtml(entry.id)}
+      <div class="modal-actions">
+        <button class="btn subtle" id="files-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.onclick = (ev)=>{ if(ev.target===overlay) closeFilesModal(); };
+  document.getElementById('files-close').onclick = closeFilesModal;
+  wireAttachmentsSection(entry.id, ()=>{
+    render();
+    const fresh = state.entries.find(e=>e.id===entry.id);
+    if(fresh) openAttachmentsModal(projectId, fresh);
+  });
+}
+function closeFilesModal(){
+  const el = document.getElementById('files-modal-overlay');
+  if(el) el.remove();
 }
 
 function escapeHtml(str){
@@ -896,24 +999,7 @@ function renderEntryModal(projectId, editing){
       `}
       <datalist id="cat-list">${CATEGORIES.map(c=>`<option value="${c}">`).join('')}</datalist>
 
-      ${editing ? `
-        <div class="attach-block">
-          <div class="attach-label">Receipts &amp; invoices</div>
-          <div class="attach-list" id="attach-list">
-            ${attachments.length===0 ? `<div class="attach-empty">No files attached yet.</div>` : attachments.map(a=>`
-              <div class="attach-item">
-                <a href="${sb.storage.from(ATTACHMENTS_BUCKET).getPublicUrl(a.storagePath).data.publicUrl}" target="_blank" rel="noopener">${escapeHtml(a.fileName)}</a>
-                <div style="display:flex;align-items:center;gap:8px;">
-                  <span class="fsize">${fmtBytes(a.sizeBytes)}</span>
-                  <button type="button" class="btn danger small" data-del-attach="${a.id}" data-path="${escapeAttr(a.storagePath)}">Remove</button>
-                </div>
-              </div>
-            `).join('')}
-          </div>
-          <input type="file" id="attach-input" multiple>
-          <div class="attach-note">Files upload immediately and are saved right away — no need to click "Save changes" for these.</div>
-        </div>
-      ` : `
+      ${editing ? attachmentsSectionHtml(editing.id) : `
         <div class="attach-note" style="margin-bottom:12px;">Save this entry first, then reopen it to attach receipts or invoices.</div>
       `}
 
@@ -939,44 +1025,9 @@ function renderEntryModal(projectId, editing){
   }
 
   if(editing){
-    document.getElementById('attach-input').onchange = async (ev)=>{
-      const files = Array.from(ev.target.files || []);
-      if(!files.length) return;
-      const label = document.querySelector('.attach-note');
-      for(const file of files){
-        try{
-          const path = `${editing.id}/${Date.now()}_${file.name}`;
-          const { error: upErr } = await sb.storage.from(ATTACHMENTS_BUCKET).upload(path, file);
-          if(upErr) throw upErr;
-          const { error: insErr } = await sb.from('attachments').insert({
-            entry_id: editing.id, file_name: file.name, storage_path: path,
-            size_bytes: file.size, content_type: file.type
-          });
-          if(insErr) throw insErr;
-          showToast(`Uploaded ${file.name}`);
-        }catch(err){
-          console.error(err);
-          showToast(`Upload failed for ${file.name}: ` + (err.message||'unknown error'));
-        }
-      }
-      await loadData();
+    wireAttachmentsSection(editing.id, ()=>{
+      render();
       renderEntryModal(projectId, state.entries.find(e=>e.id===editing.id));
-    };
-    document.querySelectorAll('[data-del-attach]').forEach(btn=>{
-      btn.onclick = async ()=>{
-        if(!confirm('Remove this attachment?')) return;
-        try{
-          await sb.storage.from(ATTACHMENTS_BUCKET).remove([btn.dataset.path]);
-          const { error } = await sb.from('attachments').delete().eq('id', btn.dataset.delAttach);
-          if(error) throw error;
-          await loadData();
-          renderEntryModal(projectId, state.entries.find(e=>e.id===editing.id));
-          showToast('Attachment removed');
-        }catch(err){
-          console.error(err);
-          showToast('Remove failed: ' + (err.message||'unknown error'));
-        }
-      };
     });
   }
 
