@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HRC Ledger — Master price list</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="loading">loading master price list…</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="shared.js"></script>
+<script>
+let state = { vendors: [], catalog: [] };
+let ui = { search: '' };
+
+async function loadData() {
+  if (!configOk) {
+    document.getElementById('app').innerHTML = renderTopNav('materials') + configErrorHtml();
+    return;
+  }
+  try {
+    const [{ data: vendors, error: vErr }, { data: catalog, error: cErr }] = await Promise.all([
+      sb.from('vendors').select('*').order('name'),
+      sb.from('materials_catalog').select('*').order('name'),
+    ]);
+    if (vErr) throw vErr;
+    if (cErr) throw cErr;
+    state.vendors = vendors || [];
+    state.catalog = (catalog || []).map(m => ({ ...m, vendorId: m.vendor_id, unitPrice: m.unit_price }));
+  } catch (err) {
+    console.error(err);
+    document.getElementById('app').innerHTML = renderTopNav('materials') + loadErrorHtml(err);
+    return;
+  }
+  render();
+}
+
+function itemsForVendor(vendorId) {
+  return state.catalog.filter(m => m.vendorId === vendorId);
+}
+
+function matchesSearch(m) {
+  if (!ui.search.trim()) return true;
+  const q = ui.search.trim().toLowerCase();
+  return (m.name || '').toLowerCase().includes(q) || (m.category || '').toLowerCase().includes(q) || (m.sku || '').toLowerCase().includes(q);
+}
+
+function render() {
+  if (!configOk) return;
+  const app = document.getElementById('app');
+
+  app.innerHTML = `
+    ${renderTopNav('materials')}
+    <div class="main-head">
+      <div>
+        <h2>Master price list</h2>
+        <div style="color:var(--ink-soft);font-size:12.5px;margin-top:4px;max-width:560px;">Your everyday vendors and prices, organized by vendor. Use this for typical small-job pricing — for a big job with special bulk rates, copy items into that project's own price list instead of editing them here.</div>
+      </div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn ghost small" id="add-vendor-btn">+ Vendor</button>
+        <button class="btn small" id="add-item-btn">+ Item</button>
+      </div>
+    </div>
+    <div class="toolbar">
+      <input type="text" class="search-input" id="search-input" placeholder="Search items, category, SKU…" value="${escapeAttr(ui.search)}">
+    </div>
+    <div id="vendor-groups"></div>
+    <div class="footnote">Shared live across your team — no login. Keep this URL private.</div>
+  `;
+
+  document.getElementById('add-vendor-btn').onclick = () => openVendorModal();
+  document.getElementById('add-item-btn').onclick = () => openCatalogItemModal();
+  document.getElementById('search-input').oninput = (ev) => { ui.search = ev.target.value; renderGroups(); };
+
+  renderGroups();
+}
+
+function renderGroups() {
+  const wrap = document.getElementById('vendor-groups');
+  const groups = state.vendors.map(v => ({ vendor: v, items: itemsForVendor(v.id).filter(matchesSearch) }));
+  const noVendorItems = state.catalog.filter(m => !m.vendorId).filter(matchesSearch);
+
+  const visibleGroups = groups.filter(g => g.items.length > 0 || !ui.search.trim());
+  const showNoVendorGroup = noVendorItems.length > 0 || (!ui.search.trim());
+
+  if (state.vendors.length === 0 && state.catalog.length === 0) {
+    wrap.innerHTML = `
+      <div class="panel">
+        <div class="empty">
+          <div class="big">Nothing in the master list yet</div>
+          <div>Add a vendor and some items to get started — this becomes the default price list every project can pull from.</div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+
+  wrap.innerHTML = visibleGroups.map(g => vendorGroupHtml(g.vendor, g.items)).join('')
+    + (showNoVendorGroup ? vendorGroupHtml(null, noVendorItems) : '');
+
+  wireGroupHandlers();
+}
+
+function vendorGroupHtml(vendor, items) {
+  const vid = vendor ? vendor.id : 'none';
+  const contactBits = vendor ? [vendor.contact_name, vendor.phone, vendor.email].filter(Boolean).join(' · ') : '';
+  return `
+    <div class="vendor-group">
+      <div class="vendor-group-head">
+        <div>
+          <h3>${vendor ? escapeHtml(vendor.name) : 'No vendor assigned'}</h3>
+          ${contactBits ? `<div class="vmeta">${escapeHtml(contactBits)}</div>` : ''}
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${vendor ? `
+            <button class="btn subtle small" data-vendor-edit="${vendor.id}">Edit vendor</button>
+            <button class="btn danger small" data-vendor-del="${vendor.id}">Delete vendor</button>
+          ` : ''}
+        </div>
+      </div>
+      <div class="vendor-group-body">
+        ${items.length === 0 ? `<div style="color:var(--ink-faint);font-size:12.5px;padding:10px 0;">No items${vendor ? ' for this vendor' : ''} yet.</div>` : `
+          <table>
+            <thead><tr><th>Item</th><th>Unit</th><th class="amount">Unit price</th><th>Category</th><th>SKU</th><th></th></tr></thead>
+            <tbody>
+              ${items.map(m => `
+                <tr>
+                  <td>${escapeHtml(m.name)}</td>
+                  <td>${escapeHtml(m.unit || '—')}</td>
+                  <td class="amount">${fmt(m.unitPrice)}</td>
+                  <td><span class="type-chip">${escapeHtml(m.category || '—')}</span></td>
+                  <td style="color:var(--ink-faint);font-size:12px;">${escapeHtml(m.sku || '')}</td>
+                  <td>
+                    <div class="rowbtns">
+                      <button class="btn subtle small" data-item-edit="${m.id}">Edit</button>
+                      <button class="btn danger small" data-item-del="${m.id}">Del</button>
+                    </div>
+                  </td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+        `}
+      </div>
+    </div>
+  `;
+}
+
+function wireGroupHandlers() {
+  document.querySelectorAll('[data-vendor-edit]').forEach(btn => {
+    btn.onclick = () => { const v = state.vendors.find(x => x.id === btn.dataset.vendorEdit); openVendorModal(v); };
+  });
+  document.querySelectorAll('[data-vendor-del]').forEach(btn => {
+    btn.onclick = () => deleteVendor(btn.dataset.vendorDel);
+  });
+  document.querySelectorAll('[data-item-edit]').forEach(btn => {
+    btn.onclick = () => { const m = state.catalog.find(x => x.id === btn.dataset.itemEdit); openCatalogItemModal(m); };
+  });
+  document.querySelectorAll('[data-item-del]').forEach(btn => {
+    btn.onclick = () => deleteCatalogItem(btn.dataset.itemDel);
+  });
+}
+
+// ---------- Vendor modal ----------
+function openVendorModal(editing) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'vendor-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${editing ? 'Edit vendor' : 'Add vendor'}</h3>
+      <div class="field">
+        <label>Vendor name</label>
+        <input type="text" id="vm-name" value="${editing ? escapeAttr(editing.name) : ''}" placeholder="e.g. Acme Supply Co.">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Contact name</label>
+          <input type="text" id="vm-contact" value="${editing ? escapeAttr(editing.contact_name || '') : ''}" placeholder="optional">
+        </div>
+        <div class="field">
+          <label>Phone</label>
+          <input type="text" id="vm-phone" value="${editing ? escapeAttr(editing.phone || '') : ''}" placeholder="optional">
+        </div>
+      </div>
+      <div class="field">
+        <label>Email</label>
+        <input type="email" id="vm-email" value="${editing ? escapeAttr(editing.email || '') : ''}" placeholder="optional">
+      </div>
+      <div class="field">
+        <label>Notes</label>
+        <textarea id="vm-notes" rows="2" placeholder="optional">${editing ? escapeHtml(editing.notes || '') : ''}</textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn subtle" id="vm-cancel">Cancel</button>
+        <button class="btn" id="vm-save">${editing ? 'Save changes' : 'Add vendor'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('vm-name').focus();
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeVendorModal(); };
+  document.getElementById('vm-cancel').onclick = closeVendorModal;
+  document.getElementById('vm-save').onclick = async () => {
+    const name = document.getElementById('vm-name').value.trim();
+    if (!name) { showToast('Vendor needs a name'); return; }
+    const payload = {
+      name,
+      contact_name: document.getElementById('vm-contact').value.trim(),
+      phone: document.getElementById('vm-phone').value.trim(),
+      email: document.getElementById('vm-email').value.trim(),
+      notes: document.getElementById('vm-notes').value.trim(),
+    };
+    const saveBtn = document.getElementById('vm-save');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      if (editing) {
+        const { error } = await sb.from('vendors').update(payload).eq('id', editing.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('vendors').insert(payload);
+        if (error) throw error;
+      }
+      await loadData();
+      closeVendorModal();
+      showToast(editing ? 'Vendor updated' : 'Vendor added');
+    } catch (err) {
+      console.error(err);
+      showToast('Save failed: ' + (err.message || 'unknown error'));
+      saveBtn.disabled = false; saveBtn.textContent = editing ? 'Save changes' : 'Add vendor';
+    }
+  };
+}
+function closeVendorModal() {
+  const el = document.getElementById('vendor-modal-overlay');
+  if (el) el.remove();
+}
+async function deleteVendor(id) {
+  const v = state.vendors.find(x => x.id === id);
+  const count = itemsForVendor(id).length;
+  const msg = count > 0
+    ? `Delete vendor "${v.name}"? Its ${count} price list item${count !== 1 ? 's' : ''} will be kept but marked as having no vendor.`
+    : `Delete vendor "${v.name}"?`;
+  if (!confirm(msg)) return;
+  try {
+    const { error } = await sb.from('vendors').delete().eq('id', id);
+    if (error) throw error;
+    await loadData();
+    showToast('Vendor deleted');
+  } catch (err) {
+    console.error(err);
+    showToast('Delete failed: ' + (err.message || 'unknown error'));
+  }
+}
+
+// ---------- Catalog item modal ----------
+function vendorSelectOptions(selectedId) {
+  return `<option value="">No vendor</option>` + state.vendors.map(v => `<option value="${v.id}" ${selectedId === v.id ? 'selected' : ''}>${escapeHtml(v.name)}</option>`).join('');
+}
+
+function openCatalogItemModal(editing) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'item-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${editing ? 'Edit master price list item' : 'Add item to master price list'}</h3>
+      <div class="field">
+        <label>Item / material name</label>
+        <input type="text" id="cm-name" value="${editing ? escapeAttr(editing.name) : ''}" placeholder="e.g. 2x4 Stud, 8ft">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Vendor</label>
+          <select id="cm-vendor">${vendorSelectOptions(editing ? editing.vendorId : null)}</select>
+        </div>
+        <div class="field">
+          <label>Unit</label>
+          <input type="text" id="cm-unit" value="${editing ? escapeAttr(editing.unit || '') : ''}" placeholder="e.g. each, box, sq ft">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Unit price (USD)</label>
+          <input type="number" id="cm-price" min="0" step="0.01" value="${editing ? editing.unitPrice : ''}" placeholder="0.00">
+        </div>
+        <div class="field">
+          <label>Category (optional)</label>
+          <input type="text" id="cm-category" list="cat-list-cm" value="${editing ? escapeAttr(editing.category || '') : ''}" placeholder="e.g. Materials">
+        </div>
+      </div>
+      <datalist id="cat-list-cm">${CATEGORIES.map(c => `<option value="${c}">`).join('')}</datalist>
+      <div class="field">
+        <label>SKU / notes (optional)</label>
+        <input type="text" id="cm-sku" value="${editing ? escapeAttr(editing.sku || '') : ''}" placeholder="Vendor item code, or any note">
+      </div>
+      <div class="modal-actions">
+        <button class="btn subtle" id="cm-cancel">Cancel</button>
+        <button class="btn" id="cm-save">${editing ? 'Save changes' : 'Add item'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('cm-name').focus();
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeCatalogItemModal(); };
+  document.getElementById('cm-cancel').onclick = closeCatalogItemModal;
+  document.getElementById('cm-save').onclick = async () => {
+    const name = document.getElementById('cm-name').value.trim();
+    if (!name) { showToast('Item needs a name'); return; }
+    const payload = {
+      name,
+      vendor_id: document.getElementById('cm-vendor').value || null,
+      unit: document.getElementById('cm-unit').value.trim(),
+      unit_price: Number(document.getElementById('cm-price').value || 0),
+      category: document.getElementById('cm-category').value.trim(),
+      sku: document.getElementById('cm-sku').value.trim(),
+    };
+    const saveBtn = document.getElementById('cm-save');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      if (editing) {
+        const { error } = await sb.from('materials_catalog').update(payload).eq('id', editing.id);
+        if (error) throw error;
+      } else {
+        const { error } = await sb.from('materials_catalog').insert(payload);
+        if (error) throw error;
+      }
+      await loadData();
+      closeCatalogItemModal();
+      showToast(editing ? 'Item updated' : 'Item added');
+    } catch (err) {
+      console.error(err);
+      showToast('Save failed: ' + (err.message || 'unknown error'));
+      saveBtn.disabled = false; saveBtn.textContent = editing ? 'Save changes' : 'Add item';
+    }
+  };
+}
+function closeCatalogItemModal() {
+  const el = document.getElementById('item-modal-overlay');
+  if (el) el.remove();
+}
+async function deleteCatalogItem(id) {
+  if (!confirm('Remove this item from the master price list? Projects that already copied it keep their own copy.')) return;
+  try {
+    const { error } = await sb.from('materials_catalog').delete().eq('id', id);
+    if (error) throw error;
+    await loadData();
+    showToast('Item removed');
+  } catch (err) {
+    console.error(err);
+    showToast('Remove failed: ' + (err.message || 'unknown error'));
+  }
+}
+
+loadData();
+</script>
+</body>
+</html>

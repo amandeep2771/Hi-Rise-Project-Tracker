@@ -1,0 +1,924 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>HRC Ledger — Project</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,700;1,9..144,500&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared.css">
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+</head>
+<body>
+<div class="app" id="app">
+  <div class="loading">loading project…</div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="shared.js"></script>
+<script>
+const PROJECT_ID = getParam('id');
+
+let state = { project: null, entries: [], lineItems: [], attachments: [], projectMaterials: [], catalog: [], vendors: [] };
+let ui = { search: '', statusFilter: 'all', modalItems: [], activeTab: 'entries' };
+
+async function loadData() {
+  if (!configOk) {
+    document.getElementById('app').innerHTML = renderTopNav(null) + configErrorHtml();
+    return;
+  }
+  if (!PROJECT_ID) {
+    document.getElementById('app').innerHTML = renderTopNav(null) + `
+      <div class="empty"><div class="big">No project specified</div><div><a class="crumb" href="index.html">← Back to all projects</a></div></div>
+    `;
+    return;
+  }
+  try {
+    const { data: project, error: projErr } = await sb.from('projects').select('*').eq('id', PROJECT_ID).maybeSingle();
+    if (projErr) throw projErr;
+    if (!project) {
+      document.getElementById('app').innerHTML = renderTopNav(null) + `
+        <div class="empty"><div class="big">Project not found</div><div>It may have been deleted. <a class="crumb" href="index.html">← Back to all projects</a></div></div>
+      `;
+      return;
+    }
+    state.project = project;
+
+    const { data: entries, error: eErr } = await sb.from('entries').select('*').eq('project_id', PROJECT_ID);
+    if (eErr) throw eErr;
+    state.entries = (entries || []).map(e => ({ ...e, entryType: e.entry_type, projectId: e.project_id }));
+    const entryIds = state.entries.map(e => e.id);
+
+    let lineItems = [], attachments = [];
+    if (entryIds.length) {
+      const [{ data: li, error: liErr }, { data: at, error: atErr }] = await Promise.all([
+        sb.from('line_items').select('*').in('entry_id', entryIds).order('sort_order'),
+        sb.from('attachments').select('*').in('entry_id', entryIds).order('created_at'),
+      ]);
+      if (liErr) throw liErr;
+      if (atErr) throw atErr;
+      lineItems = li; attachments = at;
+    }
+    state.lineItems = (lineItems || []).map(li => ({ ...li, entryId: li.entry_id, unitPrice: li.unit_price, lineTotal: li.line_total }));
+    state.attachments = (attachments || []).map(a => ({ ...a, entryId: a.entry_id, fileName: a.file_name, storagePath: a.storage_path, sizeBytes: a.size_bytes }));
+
+    const [{ data: pm, error: pmErr }, { data: cat, error: catErr }, { data: vend, error: vendErr }] = await Promise.all([
+      sb.from('project_materials').select('*').eq('project_id', PROJECT_ID).order('name'),
+      sb.from('materials_catalog').select('*').order('name'),
+      sb.from('vendors').select('*').order('name'),
+    ]);
+    if (pmErr) throw pmErr;
+    if (catErr) throw catErr;
+    if (vendErr) throw vendErr;
+    state.projectMaterials = (pm || []).map(m => ({ ...m, vendorId: m.vendor_id, unitPrice: m.unit_price }));
+    state.catalog = (cat || []).map(m => ({ ...m, vendorId: m.vendor_id, unitPrice: m.unit_price }));
+    state.vendors = vend || [];
+  } catch (err) {
+    console.error(err);
+    document.getElementById('app').innerHTML = renderTopNav(null) + loadErrorHtml(err);
+    return;
+  }
+  render();
+}
+
+function itemsForEntry(entryId) {
+  return state.lineItems.filter(li => li.entryId === entryId).sort((a, b) => a.sort_order - b.sort_order);
+}
+function attachmentsForEntry(entryId) {
+  return state.attachments.filter(a => a.entryId === entryId);
+}
+function projectTotals() {
+  const entries = state.entries;
+  const total = entries.reduce((s, e) => s + Number(e.amount || 0), 0);
+  const pending = entries.filter(e => e.status === 'pending').reduce((s, e) => s + Number(e.amount || 0), 0);
+  const paid = entries.filter(e => e.status === 'paid').reduce((s, e) => s + Number(e.amount || 0), 0);
+  return { total, pending, paid, count: entries.length };
+}
+
+// ---------- Render ----------
+function render() {
+  if (!configOk) return;
+  const project = state.project;
+  const app = document.getElementById('app');
+  const t = projectTotals();
+  const hasBudget = project.budget !== null && project.budget !== undefined && project.budget !== '';
+  const remaining = hasBudget ? Number(project.budget) - t.total : null;
+
+  app.innerHTML = `
+    ${renderTopNav(null)}
+    <a class="crumb" href="index.html">← All projects</a>
+    <div class="panel main">
+      <div class="main-head">
+        <div>
+          <h2>${escapeHtml(project.name)}</h2>
+          ${project.notes ? `<div style="color:var(--ink-soft);font-size:13px;margin-top:4px;max-width:480px;">${escapeHtml(project.notes)}</div>` : ''}
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn subtle small" id="edit-project-btn">Edit project</button>
+          <button class="btn danger small" id="delete-project-btn">Delete</button>
+        </div>
+      </div>
+      <div class="stat-row">
+        <div class="stat"><div class="label">Total logged</div><div class="value">${fmt(t.total)}</div></div>
+        <div class="stat"><div class="label">Pending</div><div class="value" style="color:var(--amber)">${fmt(t.pending)}</div></div>
+        <div class="stat"><div class="label">Paid</div><div class="value" style="color:var(--teal)">${fmt(t.paid)}</div></div>
+        ${hasBudget ? `<div class="stat"><div class="label">Budget remaining</div><div class="value ${remaining < 0 ? 'over' : ''}">${fmt(remaining)}</div></div>` : ''}
+      </div>
+      <div class="tabs">
+        <button class="tab-btn ${ui.activeTab === 'entries' ? 'active' : ''}" data-tab="entries">Purchase orders &amp; expenses</button>
+        <button class="tab-btn ${ui.activeTab === 'pricelist' ? 'active' : ''}" data-tab="pricelist">Project price list (${state.projectMaterials.length})</button>
+      </div>
+      <div id="tab-content"></div>
+    </div>
+    <div class="footnote">Shared live across your team — no login. Keep this URL private.</div>
+  `;
+
+  document.getElementById('edit-project-btn').onclick = () => openProjectModal(project);
+  document.getElementById('delete-project-btn').onclick = () => deleteProject();
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.onclick = () => { ui.activeTab = btn.dataset.tab; render(); };
+  });
+
+  if (ui.activeTab === 'entries') renderEntriesTab(); else renderPriceListTab();
+}
+
+// ---------- Entries tab ----------
+function renderEntriesTab() {
+  const project = state.project;
+  const wrap = document.getElementById('tab-content');
+  let entries = state.entries.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  if (ui.statusFilter !== 'all') entries = entries.filter(e => e.status === ui.statusFilter);
+  if (ui.search.trim()) {
+    const q = ui.search.trim().toLowerCase();
+    entries = entries.filter(e =>
+      (e.vendor || '').toLowerCase().includes(q) ||
+      (e.description || '').toLowerCase().includes(q) ||
+      (e.category || '').toLowerCase().includes(q)
+    );
+  }
+
+  wrap.innerHTML = `
+    <div class="toolbar">
+      <button class="btn" id="add-entry-btn">+ Log purchase order / expense</button>
+      <input type="text" class="search-input" id="search-input" placeholder="Search vendor, description, category…" value="${escapeAttr(ui.search)}">
+      <select id="status-filter">
+        <option value="all" ${ui.statusFilter === 'all' ? 'selected' : ''}>All statuses</option>
+        <option value="pending" ${ui.statusFilter === 'pending' ? 'selected' : ''}>Pending</option>
+        <option value="approved" ${ui.statusFilter === 'approved' ? 'selected' : ''}>Approved</option>
+        <option value="paid" ${ui.statusFilter === 'paid' ? 'selected' : ''}>Paid</option>
+      </select>
+      <button class="btn subtle small" id="export-csv-btn">Export CSV</button>
+    </div>
+    ${entries.length === 0 ? `
+      <div class="empty">
+        <div class="big">Nothing logged yet</div>
+        <div>Add your first purchase order or expense for this project.</div>
+      </div>
+    ` : `
+      <table>
+        <thead>
+          <tr><th>Date</th><th>Vendor</th><th>Description</th><th>Category</th><th>Type</th><th>Status</th><th class="amount">Amount</th><th></th></tr>
+        </thead>
+        <tbody id="entries-body">
+          ${entries.map(e => {
+            const n = attachmentsForEntry(e.id).length;
+            const itemCount = e.entryType === 'po' ? itemsForEntry(e.id).length : 0;
+            return `
+            <tr data-eid="${e.id}">
+              <td style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;white-space:nowrap;">${e.date || ''}</td>
+              <td>${escapeHtml(e.vendor || '')}</td>
+              <td style="max-width:220px;">${escapeHtml(e.description || '')}</td>
+              <td><span class="type-chip">${escapeHtml(e.category || '—')}</span></td>
+              <td><span class="type-chip">${e.entryType === 'po' ? ('PO' + (itemCount ? ' · ' + itemCount + ' item' + (itemCount !== 1 ? 's' : '') : '')) : 'Expense'}</span></td>
+              <td><span class="stamp ${e.status}">${e.status}</span></td>
+              <td class="amount">${fmt(e.amount)}${n > 0 ? ` <span class="clip-count" title="${n} attachment${n !== 1 ? 's' : ''}">📎${n}</span>` : ''}</td>
+              <td>
+                <div class="rowbtns">
+                  <button class="btn subtle small" data-files="${e.id}">Files${n > 0 ? ' (' + n + ')' : ''}</button>
+                  <button class="btn subtle small" data-edit="${e.id}">Edit</button>
+                  <button class="btn danger small" data-del="${e.id}">Del</button>
+                </div>
+              </td>
+            </tr>
+          `; }).join('')}
+        </tbody>
+      </table>
+    `}
+  `;
+
+  document.getElementById('add-entry-btn').onclick = () => openEntryModal();
+  document.getElementById('search-input').oninput = (ev) => { ui.search = ev.target.value; renderEntriesTab(); };
+  document.getElementById('status-filter').onchange = (ev) => { ui.statusFilter = ev.target.value; renderEntriesTab(); };
+  document.getElementById('export-csv-btn').onclick = () => exportCsv(entries);
+  attachEntryHandlers();
+}
+
+function attachEntryHandlers() {
+  document.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.onclick = () => { const entry = state.entries.find(e => e.id === btn.dataset.edit); openEntryModal(entry); };
+  });
+  document.querySelectorAll('[data-files]').forEach(btn => {
+    btn.onclick = () => { const entry = state.entries.find(e => e.id === btn.dataset.files); openAttachmentsModal(entry); };
+  });
+  document.querySelectorAll('[data-del]').forEach(btn => {
+    btn.onclick = () => deleteEntry(btn.dataset.del);
+  });
+}
+
+function exportCsv(entries) {
+  const header = ['Date', 'Vendor', 'Description', 'Category', 'Type', 'Status', 'Amount', 'Line Items'];
+  const rows = entries.map(e => {
+    const items = e.entryType === 'po' ? itemsForEntry(e.id) : [];
+    const itemsStr = items.map(it => `${it.description} (${it.quantity} x ${it.unitPrice})`).join('; ');
+    return [e.date, e.vendor, e.description, e.category, e.entryType === 'po' ? 'Purchase Order' : 'Expense', e.status, e.amount, itemsStr];
+  });
+  const csv = [header, ...rows].map(r => r.map(cell => {
+    const s = String(cell ?? '');
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${state.project.name.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}-ledger.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// ---------- Attachments ----------
+function attachmentsSectionHtml(entryId) {
+  const attachments = attachmentsForEntry(entryId);
+  return `
+    <div class="attach-block">
+      <div class="attach-label">Receipts &amp; invoices</div>
+      <div class="attach-list" id="attach-list">
+        ${attachments.length === 0 ? `<div class="attach-empty">No files attached yet.</div>` : attachments.map(a => `
+          <div class="attach-item">
+            <a href="${sb.storage.from(ATTACHMENTS_BUCKET).getPublicUrl(a.storagePath).data.publicUrl}" target="_blank" rel="noopener">${escapeHtml(a.fileName)}</a>
+            <div style="display:flex;align-items:center;gap:8px;">
+              <span class="fsize">${fmtBytes(a.sizeBytes)}</span>
+              <button type="button" class="btn danger small" data-del-attach="${a.id}" data-path="${escapeAttr(a.storagePath)}">Remove</button>
+            </div>
+          </div>
+        `).join('')}
+      </div>
+      <input type="file" id="attach-input" multiple>
+      <div class="attach-note">Files upload immediately and are saved right away.</div>
+    </div>
+  `;
+}
+
+function wireAttachmentsSection(entryId, onAfterChange) {
+  const fileInput = document.getElementById('attach-input');
+  if (fileInput) {
+    fileInput.onchange = async (ev) => {
+      const files = Array.from(ev.target.files || []);
+      if (!files.length) return;
+      for (const file of files) {
+        try {
+          const path = `${entryId}/${Date.now()}_${file.name}`;
+          const { error: upErr } = await sb.storage.from(ATTACHMENTS_BUCKET).upload(path, file);
+          if (upErr) throw upErr;
+          const { error: insErr } = await sb.from('attachments').insert({
+            entry_id: entryId, file_name: file.name, storage_path: path,
+            size_bytes: file.size, content_type: file.type
+          });
+          if (insErr) throw insErr;
+          showToast(`Uploaded ${file.name}`);
+        } catch (err) {
+          console.error(err);
+          showToast(`Upload failed for ${file.name}: ` + (err.message || 'unknown error'));
+        }
+      }
+      await loadData();
+      onAfterChange();
+    };
+  }
+  document.querySelectorAll('[data-del-attach]').forEach(btn => {
+    btn.onclick = async () => {
+      if (!confirm('Remove this attachment?')) return;
+      try {
+        await sb.storage.from(ATTACHMENTS_BUCKET).remove([btn.dataset.path]);
+        const { error } = await sb.from('attachments').delete().eq('id', btn.dataset.delAttach);
+        if (error) throw error;
+        await loadData();
+        showToast('Attachment removed');
+        onAfterChange();
+      } catch (err) {
+        console.error(err);
+        showToast('Remove failed: ' + (err.message || 'unknown error'));
+      }
+    };
+  });
+}
+
+function openAttachmentsModal(entry) {
+  const existing = document.getElementById('files-modal-overlay');
+  if (existing) existing.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'files-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>Files — ${escapeHtml(entry.vendor || 'entry')}</h3>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin:-8px 0 14px;">${escapeHtml(entry.description || '')} ${entry.date ? '· ' + entry.date : ''}</div>
+      ${attachmentsSectionHtml(entry.id)}
+      <div class="modal-actions">
+        <button class="btn subtle" id="files-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeFilesModal(); };
+  document.getElementById('files-close').onclick = closeFilesModal;
+  wireAttachmentsSection(entry.id, () => {
+    renderEntriesTab();
+    const fresh = state.entries.find(e => e.id === entry.id);
+    if (fresh) openAttachmentsModal(fresh);
+  });
+}
+function closeFilesModal() {
+  const el = document.getElementById('files-modal-overlay');
+  if (el) el.remove();
+}
+
+// ---------- Project modal ----------
+function openProjectModal(editing) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'project-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${editing ? 'Edit project' : 'New project'}</h3>
+      <div class="field">
+        <label>Project name</label>
+        <input type="text" id="pm-name" value="${editing ? escapeAttr(editing.name) : ''}" placeholder="e.g. Riverside Office Fit-out">
+      </div>
+      <div class="field">
+        <label>Budget (optional)</label>
+        <input type="number" id="pm-budget" value="${editing && editing.budget != null ? editing.budget : ''}" placeholder="e.g. 50000" min="0" step="0.01">
+      </div>
+      <div class="field">
+        <label>Notes (optional)</label>
+        <textarea id="pm-notes" rows="2" placeholder="Client, location, reference number…">${editing ? escapeHtml(editing.notes || '') : ''}</textarea>
+      </div>
+      <div class="modal-actions">
+        <button class="btn subtle" id="pm-cancel">Cancel</button>
+        <button class="btn" id="pm-save">${editing ? 'Save changes' : 'Create project'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('pm-name').focus();
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeProjectModal(); };
+  document.getElementById('pm-cancel').onclick = closeProjectModal;
+  document.getElementById('pm-save').onclick = async () => {
+    const name = document.getElementById('pm-name').value.trim();
+    if (!name) { showToast('Project needs a name'); return; }
+    const budgetVal = document.getElementById('pm-budget').value;
+    const notes = document.getElementById('pm-notes').value.trim();
+    const saveBtn = document.getElementById('pm-save');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      const { error } = await sb.from('projects').update({
+        name, budget: budgetVal === '' ? null : Number(budgetVal), notes
+      }).eq('id', editing.id);
+      if (error) throw error;
+      await loadData();
+      closeProjectModal();
+      showToast('Project updated');
+    } catch (err) {
+      console.error(err);
+      showToast('Save failed: ' + (err.message || 'unknown error'));
+      saveBtn.disabled = false; saveBtn.textContent = 'Save changes';
+    }
+  };
+}
+function closeProjectModal() {
+  const el = document.getElementById('project-modal-overlay');
+  if (el) el.remove();
+}
+
+async function deleteProject() {
+  if (!confirm(`Delete "${state.project.name}" and all its logged entries? This cannot be undone.`)) return;
+  try {
+    const { error } = await sb.from('projects').delete().eq('id', state.project.id);
+    if (error) throw error;
+    window.location.href = 'index.html';
+  } catch (err) {
+    console.error(err);
+    showToast('Delete failed: ' + (err.message || 'unknown error'));
+  }
+}
+
+// ---------- Entry modal (with materials-list quick pick) ----------
+let materialOptions = []; // combined list built fresh each time the modal (re)renders
+
+function buildMaterialOptions() {
+  const projectOpts = state.projectMaterials.map(m => ({
+    source: 'project',
+    label: `${m.name}${m.unit ? ' / ' + m.unit : ''} — ${fmt(m.unitPrice)}${vendorLabel(m.vendorId, state.vendors) ? ' (' + vendorLabel(m.vendorId, state.vendors) + ')' : ''}`,
+    description: m.name,
+    unitPrice: m.unitPrice,
+  }));
+  const catalogOpts = state.catalog.map(m => ({
+    source: 'catalog',
+    label: `${m.name}${m.unit ? ' / ' + m.unit : ''} — ${fmt(m.unitPrice)}${vendorLabel(m.vendorId, state.vendors) ? ' (' + vendorLabel(m.vendorId, state.vendors) + ')' : ''}`,
+    description: m.name,
+    unitPrice: m.unitPrice,
+  }));
+  return { projectOpts, catalogOpts };
+}
+
+function openEntryModal(editing) {
+  ui.modalItems = editing && editing.entryType === 'po'
+    ? itemsForEntry(editing.id).map(li => ({ description: li.description, quantity: li.quantity, unitPrice: li.unitPrice }))
+    : [];
+  renderEntryModal(editing);
+}
+
+function renderEntryModal(editing) {
+  const existing = document.getElementById('entry-modal-overlay');
+  if (existing) existing.remove();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'entry-modal-overlay';
+  const entryType = document.getElementById('em-type-live') ? document.getElementById('em-type-live').value : (editing ? editing.entryType : 'po');
+
+  overlay.innerHTML = `
+    <div class="modal wide">
+      <h3>${editing ? 'Edit entry' : 'Log purchase order / expense'}</h3>
+      <div class="field-row">
+        <div class="field">
+          <label>Type</label>
+          <select id="em-type-live">
+            <option value="po" ${entryType === 'po' ? 'selected' : ''}>Purchase Order (itemized)</option>
+            <option value="expense" ${entryType === 'expense' ? 'selected' : ''}>Expense (single amount)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>Status</label>
+          <select id="em-status">
+            <option value="pending" ${!editing || editing.status === 'pending' ? 'selected' : ''}>Pending</option>
+            <option value="approved" ${editing && editing.status === 'approved' ? 'selected' : ''}>Approved</option>
+            <option value="paid" ${editing && editing.status === 'paid' ? 'selected' : ''}>Paid</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>Vendor / payee</label>
+        <input type="text" id="em-vendor" value="${editing ? escapeAttr(editing.vendor || '') : ''}" placeholder="e.g. Acme Supply Co.">
+      </div>
+      <div class="field">
+        <label>Description</label>
+        <input type="text" id="em-description" value="${editing ? escapeAttr(editing.description || '') : ''}" placeholder="What was this for?">
+      </div>
+
+      ${entryType === 'po' ? `
+        <div class="items-block" id="items-block">
+          <div class="items-label">Line items</div>
+          <div class="pick-row">
+            <select id="pick-material">
+              <option value="">Pick from price list to add a line…</option>
+            </select>
+          </div>
+          <div class="items-head-row"><div>Description</div><div>Qty</div><div>Unit price</div><div>Total</div><div></div></div>
+          <div id="item-rows"></div>
+          <button type="button" class="btn ghost small" id="add-item-row" style="margin-top:4px;">+ Add blank line</button>
+          <div class="items-total-row"><span>Total:</span><span id="items-total-value">${fmt(0)}</span></div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Date</label>
+            <input type="date" id="em-date" value="${editing ? (editing.date || '') : new Date().toISOString().slice(0, 10)}">
+          </div>
+          <div class="field">
+            <label>Category</label>
+            <input type="text" id="em-category" list="cat-list" value="${editing ? escapeAttr(editing.category || '') : ''}" placeholder="e.g. Materials">
+          </div>
+        </div>
+      ` : `
+        <div class="field-row">
+          <div class="field">
+            <label>Amount (USD)</label>
+            <input type="number" id="em-amount" value="${editing && editing.entryType === 'expense' ? editing.amount : ''}" placeholder="0.00" min="0" step="0.01">
+          </div>
+          <div class="field">
+            <label>Date</label>
+            <input type="date" id="em-date" value="${editing ? (editing.date || '') : new Date().toISOString().slice(0, 10)}">
+          </div>
+        </div>
+        <div class="field">
+          <label>Category</label>
+          <input type="text" id="em-category" list="cat-list" value="${editing ? escapeAttr(editing.category || '') : ''}" placeholder="e.g. Materials">
+        </div>
+      `}
+      <datalist id="cat-list">${CATEGORIES.map(c => `<option value="${c}">`).join('')}</datalist>
+
+      ${editing ? attachmentsSectionHtml(editing.id) : `
+        <div class="attach-note" style="margin-bottom:12px;">Save this entry first, then reopen it to attach receipts or invoices.</div>
+      `}
+
+      <div class="modal-actions">
+        <button class="btn subtle" id="em-cancel">Cancel</button>
+        <button class="btn" id="em-save">${editing ? 'Save changes' : 'Add entry'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('em-vendor').focus();
+
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeEntryModal(); };
+  document.getElementById('em-cancel').onclick = closeEntryModal;
+  document.getElementById('em-type-live').onchange = () => renderEntryModal(editing);
+
+  if (entryType === 'po') {
+    const { projectOpts, catalogOpts } = buildMaterialOptions();
+    materialOptions = [...projectOpts, ...catalogOpts];
+    const pickSelect = document.getElementById('pick-material');
+    let html = '<option value="">Pick from price list to add a line…</option>';
+    if (projectOpts.length) {
+      html += `<optgroup label="This project's price list">${projectOpts.map((o, i) => `<option value="${i}">${escapeHtml(o.label)}</option>`).join('')}</optgroup>`;
+    }
+    if (catalogOpts.length) {
+      html += `<optgroup label="Master price list">${catalogOpts.map((o, i) => `<option value="${i + projectOpts.length}">${escapeHtml(o.label)}</option>`).join('')}</optgroup>`;
+    }
+    if (!projectOpts.length && !catalogOpts.length) {
+      html = `<option value="">No price list items yet — add some on the Project price list tab or Master price list page</option>`;
+    }
+    pickSelect.innerHTML = html;
+    pickSelect.onchange = () => {
+      const idx = pickSelect.value;
+      if (idx === '') return;
+      const opt = materialOptions[Number(idx)];
+      if (opt) {
+        ui.modalItems.push({ description: opt.description, quantity: 1, unitPrice: opt.unitPrice });
+        renderItemRows();
+      }
+      pickSelect.value = '';
+    };
+
+    renderItemRows();
+    document.getElementById('add-item-row').onclick = () => {
+      ui.modalItems.push({ description: '', quantity: 1, unitPrice: 0 });
+      renderItemRows();
+    };
+  }
+
+  if (editing) {
+    wireAttachmentsSection(editing.id, () => {
+      renderEntriesTab();
+      renderEntryModal(state.entries.find(e => e.id === editing.id));
+    });
+  }
+
+  document.getElementById('em-save').onclick = async () => {
+    const currentType = document.getElementById('em-type-live').value;
+    const vendor = document.getElementById('em-vendor').value.trim();
+    if (!vendor) { showToast('Vendor / payee is required'); return; }
+
+    let amount = 0;
+    if (currentType === 'po') {
+      const validItems = ui.modalItems.filter(it => (it.description || '').trim() !== '' || Number(it.quantity) > 0);
+      if (validItems.length === 0) { showToast('Add at least one line item'); return; }
+      amount = validItems.reduce((s, it) => s + Number(it.quantity || 0) * Number(it.unitPrice || 0), 0);
+      if (amount <= 0) { showToast('Line item total must be greater than 0'); return; }
+    } else {
+      amount = Number(document.getElementById('em-amount').value || 0);
+      if (amount <= 0) { showToast('Enter an amount greater than 0'); return; }
+    }
+
+    const payload = {
+      entry_type: currentType,
+      status: document.getElementById('em-status').value,
+      vendor,
+      description: document.getElementById('em-description').value.trim(),
+      amount,
+      date: document.getElementById('em-date').value || null,
+      category: document.getElementById('em-category').value.trim(),
+    };
+
+    const saveBtn = document.getElementById('em-save');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      let entryId;
+      if (editing) {
+        entryId = editing.id;
+        const { error } = await sb.from('entries').update(payload).eq('id', entryId);
+        if (error) throw error;
+      } else {
+        payload.project_id = PROJECT_ID;
+        const { data, error } = await sb.from('entries').insert(payload).select().single();
+        if (error) throw error;
+        entryId = data.id;
+      }
+
+      if (currentType === 'po') {
+        const { error: delErr } = await sb.from('line_items').delete().eq('entry_id', entryId);
+        if (delErr) throw delErr;
+        const validItems = ui.modalItems.filter(it => (it.description || '').trim() !== '' || Number(it.quantity) > 0);
+        if (validItems.length) {
+          const rows = validItems.map((it, idx) => ({
+            entry_id: entryId,
+            description: (it.description || '').trim(),
+            quantity: Number(it.quantity || 0),
+            unit_price: Number(it.unitPrice || 0),
+            sort_order: idx
+          }));
+          const { error: insErr } = await sb.from('line_items').insert(rows);
+          if (insErr) throw insErr;
+        }
+      } else if (editing && editing.entryType === 'po') {
+        await sb.from('line_items').delete().eq('entry_id', entryId);
+      }
+
+      await loadData();
+      const freshEntry = state.entries.find(e => e.id === entryId);
+      showToast(editing ? 'Entry updated' : 'Entry logged');
+      openEntryModal(freshEntry);
+    } catch (err) {
+      console.error(err);
+      showToast('Save failed: ' + (err.message || 'unknown error'));
+      saveBtn.disabled = false; saveBtn.textContent = editing ? 'Save changes' : 'Add entry';
+    }
+  };
+}
+
+function renderItemRows() {
+  const wrap = document.getElementById('item-rows');
+  if (!wrap) return;
+  wrap.innerHTML = ui.modalItems.map((it, idx) => `
+    <div class="item-row" data-idx="${idx}">
+      <input type="text" class="it-desc" placeholder="Item description" value="${escapeAttr(it.description)}">
+      <input type="number" class="it-qty" min="0" step="0.01" value="${it.quantity}">
+      <input type="number" class="it-price" min="0" step="0.01" value="${it.unitPrice}">
+      <div class="item-total">${fmt(Number(it.quantity || 0) * Number(it.unitPrice || 0))}</div>
+      <button type="button" class="rm-item" title="Remove line">×</button>
+    </div>
+  `).join('');
+
+  wrap.querySelectorAll('.item-row').forEach(row => {
+    const idx = Number(row.dataset.idx);
+    row.querySelector('.it-desc').oninput = (ev) => { ui.modalItems[idx].description = ev.target.value; };
+    row.querySelector('.it-qty').oninput = (ev) => { ui.modalItems[idx].quantity = ev.target.value; updateItemsTotal(); row.querySelector('.item-total').textContent = fmt(Number(ev.target.value || 0) * Number(ui.modalItems[idx].unitPrice || 0)); };
+    row.querySelector('.it-price').oninput = (ev) => { ui.modalItems[idx].unitPrice = ev.target.value; updateItemsTotal(); row.querySelector('.item-total').textContent = fmt(Number(ui.modalItems[idx].quantity || 0) * Number(ev.target.value || 0)); };
+    row.querySelector('.rm-item').onclick = () => { ui.modalItems.splice(idx, 1); renderItemRows(); updateItemsTotal(); };
+  });
+  updateItemsTotal();
+}
+function updateItemsTotal() {
+  const totalEl = document.getElementById('items-total-value');
+  if (!totalEl) return;
+  const total = ui.modalItems.reduce((s, it) => s + Number(it.quantity || 0) * Number(it.unitPrice || 0), 0);
+  totalEl.textContent = fmt(total);
+}
+
+function closeEntryModal() {
+  const el = document.getElementById('entry-modal-overlay');
+  if (el) el.remove();
+  ui.modalItems = [];
+}
+
+async function deleteEntry(id) {
+  if (!confirm('Delete this entry? Any attached files will also be removed.')) return;
+  try {
+    const atts = attachmentsForEntry(id);
+    if (atts.length) {
+      await sb.storage.from(ATTACHMENTS_BUCKET).remove(atts.map(a => a.storagePath));
+    }
+    const { error } = await sb.from('entries').delete().eq('id', id);
+    if (error) throw error;
+    await loadData();
+    showToast('Entry deleted');
+  } catch (err) {
+    console.error(err);
+    showToast('Delete failed: ' + (err.message || 'unknown error'));
+  }
+}
+
+// ---------- Project price list tab ----------
+function renderPriceListTab() {
+  const wrap = document.getElementById('tab-content');
+  const items = state.projectMaterials.slice().sort((a, b) => a.name.localeCompare(b.name));
+
+  wrap.innerHTML = `
+    <div class="toolbar">
+      <button class="btn" id="add-material-btn">+ Add item</button>
+      <button class="btn ghost small" id="import-material-btn">Copy from master price list</button>
+    </div>
+    <div style="font-size:12.5px;color:var(--ink-soft);margin:-4px 0 14px;">This project's own prices — useful when a vendor gives you a different (often bulk) rate for this job. These show up first in the price-list dropdown when adding purchase order lines.</div>
+    ${items.length === 0 ? `
+      <div class="empty">
+        <div class="big">No project-specific prices yet</div>
+        <div>Add items here, or copy some from the master price list to start from.</div>
+      </div>
+    ` : `
+      <table>
+        <thead><tr><th>Item</th><th>Vendor</th><th>Unit</th><th class="amount">Unit price</th><th>Category</th><th></th></tr></thead>
+        <tbody>
+          ${items.map(m => `
+            <tr data-mid="${m.id}">
+              <td>${escapeHtml(m.name)}${m.sku ? ` <span style="color:var(--ink-faint);font-size:11.5px;">(${escapeHtml(m.sku)})</span>` : ''}</td>
+              <td>${vendorLabel(m.vendorId, state.vendors) ? `<span class="vendor-tag">${escapeHtml(vendorLabel(m.vendorId, state.vendors))}</span>` : `<span class="no-vendor-tag">—</span>`}</td>
+              <td>${escapeHtml(m.unit || '—')}</td>
+              <td class="amount">${fmt(m.unitPrice)}</td>
+              <td><span class="type-chip">${escapeHtml(m.category || '—')}</span></td>
+              <td>
+                <div class="rowbtns">
+                  <button class="btn subtle small" data-pm-edit="${m.id}">Edit</button>
+                  <button class="btn danger small" data-pm-del="${m.id}">Del</button>
+                </div>
+              </td>
+            </tr>
+          `).join('')}
+        </tbody>
+      </table>
+    `}
+  `;
+
+  document.getElementById('add-material-btn').onclick = () => openMaterialModal();
+  document.getElementById('import-material-btn').onclick = () => openImportModal();
+  document.querySelectorAll('[data-pm-edit]').forEach(btn => {
+    btn.onclick = () => { const m = state.projectMaterials.find(x => x.id === btn.dataset.pmEdit); openMaterialModal(m); };
+  });
+  document.querySelectorAll('[data-pm-del]').forEach(btn => {
+    btn.onclick = () => deleteMaterial(btn.dataset.pmDel);
+  });
+}
+
+function vendorSelectOptions(selectedId) {
+  return `<option value="">No vendor</option>` + state.vendors.map(v => `<option value="${v.id}" ${selectedId === v.id ? 'selected' : ''}>${escapeHtml(v.name)}</option>`).join('');
+}
+
+function openMaterialModal(editing) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'material-modal-overlay';
+  overlay.innerHTML = `
+    <div class="modal">
+      <h3>${editing ? 'Edit price list item' : 'Add item to project price list'}</h3>
+      <div class="field">
+        <label>Item / material name</label>
+        <input type="text" id="mm-name" value="${editing ? escapeAttr(editing.name) : ''}" placeholder="e.g. 2x4 Stud, 8ft">
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Vendor</label>
+          <select id="mm-vendor">${vendorSelectOptions(editing ? editing.vendorId : null)}</select>
+        </div>
+        <div class="field">
+          <label>Unit</label>
+          <input type="text" id="mm-unit" value="${editing ? escapeAttr(editing.unit || '') : ''}" placeholder="e.g. each, box, sq ft">
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Unit price (USD)</label>
+          <input type="number" id="mm-price" min="0" step="0.01" value="${editing ? editing.unitPrice : ''}" placeholder="0.00">
+        </div>
+        <div class="field">
+          <label>Category (optional)</label>
+          <input type="text" id="mm-category" list="cat-list-mm" value="${editing ? escapeAttr(editing.category || '') : ''}" placeholder="e.g. Materials">
+        </div>
+      </div>
+      <datalist id="cat-list-mm">${CATEGORIES.map(c => `<option value="${c}">`).join('')}</datalist>
+      <div class="field">
+        <label>SKU / notes (optional)</label>
+        <input type="text" id="mm-sku" value="${editing ? escapeAttr(editing.sku || '') : ''}" placeholder="Vendor item code, or any note">
+      </div>
+      <div class="modal-actions">
+        <button class="btn subtle" id="mm-cancel">Cancel</button>
+        <button class="btn" id="mm-save">${editing ? 'Save changes' : 'Add item'}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  document.getElementById('mm-name').focus();
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeMaterialModal(); };
+  document.getElementById('mm-cancel').onclick = closeMaterialModal;
+  document.getElementById('mm-save').onclick = async () => {
+    const name = document.getElementById('mm-name').value.trim();
+    if (!name) { showToast('Item needs a name'); return; }
+    const price = Number(document.getElementById('mm-price').value || 0);
+    const payload = {
+      name,
+      vendor_id: document.getElementById('mm-vendor').value || null,
+      unit: document.getElementById('mm-unit').value.trim(),
+      unit_price: price,
+      category: document.getElementById('mm-category').value.trim(),
+      sku: document.getElementById('mm-sku').value.trim(),
+    };
+    const saveBtn = document.getElementById('mm-save');
+    saveBtn.disabled = true; saveBtn.textContent = 'Saving…';
+    try {
+      if (editing) {
+        const { error } = await sb.from('project_materials').update(payload).eq('id', editing.id);
+        if (error) throw error;
+      } else {
+        payload.project_id = PROJECT_ID;
+        const { error } = await sb.from('project_materials').insert(payload);
+        if (error) throw error;
+      }
+      await loadData();
+      ui.activeTab = 'pricelist';
+      render();
+      closeMaterialModal();
+      showToast(editing ? 'Item updated' : 'Item added');
+    } catch (err) {
+      console.error(err);
+      showToast('Save failed: ' + (err.message || 'unknown error'));
+      saveBtn.disabled = false; saveBtn.textContent = editing ? 'Save changes' : 'Add item';
+    }
+  };
+}
+function closeMaterialModal() {
+  const el = document.getElementById('material-modal-overlay');
+  if (el) el.remove();
+}
+
+async function deleteMaterial(id) {
+  if (!confirm('Remove this item from the project price list?')) return;
+  try {
+    const { error } = await sb.from('project_materials').delete().eq('id', id);
+    if (error) throw error;
+    await loadData();
+    ui.activeTab = 'pricelist';
+    render();
+    showToast('Item removed');
+  } catch (err) {
+    console.error(err);
+    showToast('Remove failed: ' + (err.message || 'unknown error'));
+  }
+}
+
+function openImportModal() {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'import-modal-overlay';
+  const catalog = state.catalog.slice().sort((a, b) => a.name.localeCompare(b.name));
+  overlay.innerHTML = `
+    <div class="modal wide">
+      <h3>Copy from master price list</h3>
+      <div style="font-size:12.5px;color:var(--ink-soft);margin:-8px 0 14px;">Adds a copy into this project's price list, which you can then adjust (e.g. for a bulk-order rate) without changing the master list.</div>
+      ${catalog.length === 0 ? `
+        <div class="empty"><div class="big">Master price list is empty</div><div>Add vendors and items on the Master price list page first.</div></div>
+      ` : `
+        <table>
+          <thead><tr><th>Item</th><th>Vendor</th><th>Unit</th><th class="amount">Unit price</th><th></th></tr></thead>
+          <tbody>
+            ${catalog.map(m => `
+              <tr>
+                <td>${escapeHtml(m.name)}</td>
+                <td>${vendorLabel(m.vendorId, state.vendors) ? `<span class="vendor-tag">${escapeHtml(vendorLabel(m.vendorId, state.vendors))}</span>` : `<span class="no-vendor-tag">—</span>`}</td>
+                <td>${escapeHtml(m.unit || '—')}</td>
+                <td class="amount">${fmt(m.unitPrice)}</td>
+                <td><button class="btn ghost small" data-import="${m.id}">+ Add to project</button></td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      `}
+      <div class="modal-actions">
+        <button class="btn subtle" id="import-close">Close</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.onclick = (ev) => { if (ev.target === overlay) closeImportModal(); };
+  document.getElementById('import-close').onclick = closeImportModal;
+  document.querySelectorAll('[data-import]').forEach(btn => {
+    btn.onclick = async () => {
+      const src = state.catalog.find(m => m.id === btn.dataset.import);
+      if (!src) return;
+      btn.disabled = true; btn.textContent = 'Added ✓';
+      try {
+        const { error } = await sb.from('project_materials').insert({
+          project_id: PROJECT_ID,
+          vendor_id: src.vendorId,
+          name: src.name,
+          unit: src.unit,
+          unit_price: src.unitPrice,
+          category: src.category,
+          sku: src.sku,
+          source_catalog_id: src.id,
+        });
+        if (error) throw error;
+        await loadData();
+        showToast(`Copied "${src.name}" into project price list`);
+      } catch (err) {
+        console.error(err);
+        showToast('Copy failed: ' + (err.message || 'unknown error'));
+        btn.disabled = false; btn.textContent = '+ Add to project';
+      }
+    };
+  });
+}
+function closeImportModal() {
+  const el = document.getElementById('import-modal-overlay');
+  if (el) el.remove();
+}
+
+loadData();
+</script>
+</body>
+</html>
